@@ -1,32 +1,50 @@
-name: GOCI-II Cloud Harvester & ECS 250m Cropper
+name: GOCI-II Monthly Harvester & ECS 250m Matrix
 
 on:
   workflow_dispatch:
     inputs:
-      date:
-        description: '采集日期 (格式: YYYY-MM-DD)'
+      year_month:
+        description: '目标年月 (格式: YYYY-MM)'
         required: true
-        default: '2024-05-15'
+        default: '2024-05'
       product:
-        description: '产品类型 (TSS 或 AC)'
+        description: '产品类型 (AC 或 TSS)'
         required: true
         default: 'AC'
         type: choice
         options:
           - AC
           - TSS
-      hours:
-        description: 'UTC 小时 (空格分隔, 默认 03 04 05 正午三景)'
-        required: false
-        default: '03 04 05'
 
-# 授予工作流自动发布 Release 的权限
 permissions:
   contents: write
 
 jobs:
-  harvest-and-crop:
+  harvest-matrix:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # 即使某天缺测，其他批次继续跑
+      matrix:
+        include:
+          - part: 1
+            start_day: 1
+            end_day: 5
+          - part: 2
+            start_day: 6
+            end_day: 10
+          - part: 3
+            start_day: 11
+            end_day: 15
+          - part: 4
+            start_day: 16
+            end_day: 20
+          - part: 5
+            start_day: 21
+            end_day: 25
+          - part: 6
+            start_day: 26
+            end_day: 31
+
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4
@@ -40,13 +58,18 @@ jobs:
         run: |
           pip install requests urllib3 h5py netCDF4 numpy
 
-      - name: 启动云端免密拉取与原生 250m 纯切片
+      - name: 启动分块并发切片
         run: |
-          python crop_goci2.py --date "${{ inputs.date }}" --product "${{ inputs.product }}" --hours ${{ inputs.hours }}
+          python crop_goci2.py \
+            --year_month "${{ inputs.year_month }}" \
+            --start_day ${{ matrix.start_day }} \
+            --end_day ${{ matrix.end_day }} \
+            --product "${{ inputs.product }}" \
+            --output "output_ecs/GOCI2_250m_ECS_${{ inputs.year_month }}_part${{ matrix.part }}_d${{ matrix.start_day }}to${{ matrix.end_day }}_${{ inputs.product }}.nc"
 
-      - name: 自动发布至 Release (供本地脚本免代理免密直连同步)
+      - name: 自动发布至 Release (供本地免代理直连合并)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.date }}-${{ inputs.product }}
-          name: GOCI-II 250m ECS ${{ inputs.date }} ${{ inputs.product }}
+          tag_name: ${{ inputs.year_month }}-${{ inputs.product }}
+          name: GOCI-II 250m ECS ${{ inputs.year_month }} ${{ inputs.product }} (Monthly Parts)
           files: output_ecs/*.nc
