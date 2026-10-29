@@ -1,0 +1,49 @@
+name: GOCI-II Cloud Harvester & ECS 250m Cropper
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '采集日期 (格式: YYYY-MM-DD)'
+        required: true
+        default: '2024-05-15'
+      product:
+        description: '产品类型 (TSS 或 AC)'
+        required: true
+        default: 'TSS'
+        type: choice
+        options:
+          - TSS
+          - AC
+      hours:
+        description: 'UTC 小时 (空格分隔, 默认 03 04 05 正午三景)'
+        required: false
+        default: '03 04 05'
+
+jobs:
+  harvest-and-crop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装基础科学库
+        run: |
+          pip install requests urllib3 h5py netCDF4 numpy
+
+      - name: 启动云端免密拉取与原生 250m 纯切片
+        run: |
+          python crop_goci2.py --date "${{ inputs.date }}" --product "${{ inputs.product }}" --hours ${{ inputs.hours }}
+
+      - name: 归档轻量化成品并发布下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: GOCI2_250m_ECS_${{ inputs.date }}_${{ inputs.product }}
+          path: output_ecs/*.nc
+          retention-days: 30
