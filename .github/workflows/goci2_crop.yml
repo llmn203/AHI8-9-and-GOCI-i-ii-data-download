@@ -6,7 +6,7 @@ on:
       year_month:
         description: '目标年月 (格式: YYYY-MM)'
         required: true
-        default: '2024-05'
+        default: '2024-02'
       product:
         description: '产品类别 (AC 或 TSS)'
         required: true
@@ -18,11 +18,22 @@ on:
       scope:
         description: '执行模式选择'
         required: true
-        default: 'test_single_day (极速验证模式: 仅切片 15 日单天，3分钟出结果)'
+        default: 'full_month (全月生产模式: 6 矩阵并发满速全月)'
         type: choice
         options:
-          - 'test_single_day (极速验证模式: 仅切片 15 日单天，3分钟出结果)'
           - 'full_month (全月生产模式: 6 矩阵并发满速全月)'
+          - 'custom_patch (自定义补录模式: 仅切片指定天数区间，如 26-29)'
+          - 'test_single_day (极速验证模式: 仅切片 15 日单天，3分钟出结果)'
+      patch_start_day:
+        description: '【仅补录模式生效】起始日 (1-31)'
+        required: false
+        default: 26
+        type: number
+      patch_end_day:
+        description: '【仅补录模式生效】结束日 (1-31)'
+        required: false
+        default: 29
+        type: number
 
 permissions:
   contents: write
@@ -55,9 +66,10 @@ jobs:
             --start_day 15 \
             --end_day 15 \
             --product "${{ inputs.product }}" \
-            --output_dir "output_ecs"
+            --output_dir output_ecs
 
       - name: 自动发布至 Release (测试专用 Tag)
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.year_month }}-${{ inputs.product }}-TEST
@@ -65,7 +77,44 @@ jobs:
           files: output_ecs/*.nc
 
   # =========================================================================
-  # 模式 B: 全月生产模式 (6 台矩阵虚拟机并发，按天输出独立文件)
+  # 模式 B: 自定义区间补录模式 (仅启动 1 台机器，快速补录指定日期，如 26-29 日)
+  # =========================================================================
+  custom-patch:
+    if: startsWith(inputs.scope, 'custom_patch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖与 aria2 多线程加速引擎
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y aria2
+          pip install requests urllib3 h5py netCDF4 numpy
+
+      - name: 启动多线程分块切片 (补录指定区间)
+        run: |
+          python crop_goci2.py \
+            --year_month "${{ inputs.year_month }}" \
+            --start_day ${{ inputs.patch_start_day }} \
+            --end_day ${{ inputs.patch_end_day }} \
+            --product "${{ inputs.product }}" \
+            --output_dir output_ecs
+
+      - name: 自动发布至 Release (供本地免代理直连归档)
+        if: always()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.year_month }}-${{ inputs.product }}
+          name: GOCI-II 250m ECS ${{ inputs.year_month }} ${{ inputs.product }}
+          files: output_ecs/*.nc
+
+  # =========================================================================
+  # 模式 C: 全月生产模式 (6 台矩阵虚拟机并发，自带闰年与大小月安全截断)
   # =========================================================================
   harvest-matrix:
     if: startsWith(inputs.scope, 'full_month')
@@ -114,11 +163,12 @@ jobs:
             --start_day ${{ matrix.start_day }} \
             --end_day ${{ matrix.end_day }} \
             --product "${{ inputs.product }}" \
-            --output_dir "output_ecs"
+            --output_dir output_ecs
 
       - name: 自动发布至 Release (供本地免代理直连归档)
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.year_month }}-${{ inputs.product }}
-          name: GOCI-II 250m ECS ${{ inputs.year_month }} ${{ inputs.product }} (Daily Files)
+          name: GOCI-II 250m ECS ${{ inputs.year_month }} ${{ inputs.product }}
           files: output_ecs/*.nc
