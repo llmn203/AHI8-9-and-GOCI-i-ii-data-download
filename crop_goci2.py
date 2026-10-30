@@ -8,6 +8,7 @@ import time
 import shutil
 import argparse
 import subprocess
+import calendar
 import requests
 import urllib3
 import h5py
@@ -18,6 +19,7 @@ from datetime import datetime
 urllib3.disable_warnings()
 
 BASE_OPENDAP = "https://www.nosc.go.kr/opendap/GOCI-II"
+DEFAULT_REPO = "llmn203/AHI8-9-and-GOCI-i-ii-data-download"
 
 # 针对 AHI 目标区 [117.0°E ~ 126.0°E, 25.0°N ~ 35.0°N] 的严格原生像元切片 (保持 250m 原生分辨率)
 ROW_START, ROW_END = 3776, 7335  # 3559 行 (纬度向)
@@ -166,17 +168,39 @@ def append_slot_to_nc(nc_path, raw_nc, dt_slot, product):
                 dst.variables[vname][cur_idx, :, :] = arr
 
 
+def check_asset_exists_in_release(repo, tag, filename):
+    """探测 GitHub Release 中是否已存在切片资产，避免重跑时重复下载切片"""
+    url = f"https://github.com/{repo}/releases/download/{tag}/{filename}"
+    try:
+        r = requests.head(url, timeout=5, allow_redirects=True)
+        if r.status_code == 200:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def make_bar(pct, width=15):
     filled = int(width * pct / 100)
     return "█" * filled + "░" * (width - filled)
 
 
-def process_single_day(year, month, day, product, hours, output_dir):
+def process_single_day(year, month, day, product, hours, output_dir, tag=None):
     """处理单一完整自然日 (10 帧切片合并为单日独立单文件 ~500-600MB)"""
     day_str = f"{year:04d}-{month:02d}-{day:02d}"
     date_tag = f"{year:04d}{month:02d}{day:02d}"
     out_nc_name = f"GOCI2_250m_ECS_{date_tag}_{product.upper()}.nc"
     out_nc_path = os.path.join(output_dir, out_nc_name)
+
+    # 1. 检查本地是否已有完好的切片产物
+    if os.path.exists(out_nc_path) and os.path.getsize(out_nc_path) > 10 * 1024 * 1024:
+        print(f"\n  [√ 本地已存在] {out_nc_name} 已就绪，秒级跳过！", flush=True)
+        return True
+
+    # 2. 检查云端 Release 是否已发布过
+    if tag and check_asset_exists_in_release(DEFAULT_REPO, tag, out_nc_name):
+        print(f"\n  [√ 云端已发布] Release [{tag}] 已包含 {out_nc_name}，秒级跳过！", flush=True)
+        return True
 
     slots = get_available_slots(day_str)
     target_slots = [s for s in slots if s.split("_")[-1][:2] in hours]
@@ -255,18 +279,31 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     year, month = int(args.year_month.split("-")[0]), int(args.year_month.split("-")[1])
-    num_days = args.end_day - args.start_day + 1
+    tag = f"{args.year_month}-{args.product.upper()}"
+
+    # 动态获取当月实际最大天数 (如 2024年2月为 29 天，4月为 30 天)
+    # 彻底杜绝 2024-02-30 引发 ValueError: day is out of range for month 导致发布中断
+    _, max_day = calendar.monthrange(year, month)
+    effective_start = args.start_day
+    effective_end = min(args.end_day, max_day)
+
+    if effective_start > max_day:
+        print(f"\n[跳过] 起始日 {effective_start} 超过该月自然总天数 ({max_day} 天)，无须切片任务。", flush=True)
+        return
+
+    num_days = effective_end - effective_start + 1
 
     print("=" * 96, flush=True)
     print(f"  GOCI-II 250m 东海原生网格按天单文件流水线 (单日单文件 ~600MB·12波段完整修复版)", flush=True)
-    print(f"  区间: {args.year_month}-{args.start_day:02d} 至 {args.year_month}-{args.end_day:02d} (共 {num_days} 天) | 产品: {args.product}", flush=True)
+    print(f"  区间: {args.year_month}-{effective_start:02d} 至 {args.year_month}-{effective_end:02d} (共 {num_days} 天) | 产品: {args.product}", flush=True)
     print(f"  每日时次: 10 帧全覆盖 ({', '.join(args.hours)} UTC)", flush=True)
-    print(f"  单日产物格式: output_ecs/GOCI2_250m_ECS_YYYYMMDD_{args.product}.nc", flush=True)
+    print(f"  单日产物格式: {args.output_dir}/GOCI2_250m_ECS_YYYYMMDD_{args.product}.nc", flush=True)
     print("=" * 96, flush=True)
 
-    for day in range(args.start_day, args.end_day + 1):
-        process_single_day(year, month, day, args.product, args.hours, args.output_dir)
+    for day in range(effective_start, effective_end + 1):
+        process_single_day(year, month, day, args.product, args.hours, args.output_dir, tag=tag)
 
 
 if __name__ == "__main__":
     main()
+
