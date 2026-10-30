@@ -16,7 +16,7 @@ on:
           - AC
           - TSS
       scope:
-        description: '执行模式'
+        description: '执行模式选择'
         required: true
         default: 'test_single_day (极速验证模式: 仅切片 15 日单天，3分钟出结果)'
         type: choice
@@ -55,7 +55,7 @@ jobs:
             --start_day 15 \
             --end_day 15 \
             --product "${{ inputs.product }}" \
-            --output "output_ecs/GOCI2_250m_ECS_${{ inputs.year_month }}_test_d15_${{ inputs.product }}.nc"
+            --output_dir "output_ecs"
 
       - name: 自动发布至 Release (测试专用 Tag)
         uses: softprops/action-gh-release@v2
@@ -65,7 +65,7 @@ jobs:
           files: output_ecs/*.nc
 
   # =========================================================================
-  # 模式 B: 全月生产模式 (6 台矩阵虚拟机并发)
+  # 模式 B: 全月生产模式 (6 台矩阵虚拟机并发，按天输出独立文件)
   # =========================================================================
   harvest-matrix:
     if: startsWith(inputs.scope, 'full_month')
@@ -107,18 +107,18 @@ jobs:
           sudo apt-get update -y && sudo apt-get install -y aria2
           pip install requests urllib3 h5py netCDF4 numpy
 
-      - name: 启动多线程分块切片 (12波段穿透提取)
+      - name: 启动多线程分块切片 (逐日输出单文件)
         run: |
           python crop_goci2.py \
             --year_month "${{ inputs.year_month }}" \
             --start_day ${{ matrix.start_day }} \
             --end_day ${{ matrix.end_day }} \
             --product "${{ inputs.product }}" \
-            --output "output_ecs/GOCI2_250m_ECS_${{ inputs.year_month }}_part${{ matrix.part }}_d${{ matrix.start_day }}to${{ matrix.end_day }}_${{ inputs.product }}.nc"
+            --output_dir "output_ecs"
 
-      - name: 自动发布至 Release (供本地免代理直连合并)
+      - name: 自动发布至 Release (供本地免代理直连归档)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.year_month }}-${{ inputs.product }}
-          name: GOCI-II 250m ECS ${{ inputs.year_month }} ${{ inputs.product }} (Monthly Parts)
+          name: GOCI-II 250m ECS ${{ inputs.year_month }} ${{ inputs.product }} (Daily Files)
           files: output_ecs/*.nc
