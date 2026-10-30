@@ -1,5 +1,5 @@
 """
-crop_goci2.py - GOCI-II 250m 东海原生网格多时序追加与纯切片引擎 (12波段穿透修复·单行看板加速版)
+crop_goci2.py - GOCI-II 250m 东海原生网格按天单文件切片引擎 (单日单文件 ~600MB·12波段完整修复版)
 """
 import os
 import re
@@ -44,9 +44,8 @@ def get_available_slots(date_str):
 def download_file_accelerated(url, out_path):
     """
     高性能多线程下载：
-    优先检测并使用 aria2c (16 连接分块并发，秒破服务器端单连接流控)；
+    优先使用 aria2c (16 连接分块并发，秒破服务器端单连接流控)；
     若未安装则自动回退至静默 curl (-k -s -S，杜绝几万行进度条刷屏)。
-    返回: (成功标志 bool, 耗时秒 float, 平均速度 MB/s float)
     """
     t0 = time.time()
     out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
@@ -89,8 +88,8 @@ def download_file_accelerated(url, out_path):
         return False, max(0.01, time.time() - t0), 0.0
 
 
-def init_multitime_nc(nc_path, sample_raw_nc, product):
-    """初始化带 time 无限维度的多时次 NetCDF4 文件，静态经纬度只存 1 次"""
+def init_daily_nc(nc_path, sample_raw_nc, product):
+    """初始化单日 NetCDF4 文件 (包含全天多时次，静态经纬度只存 1 次)"""
     with h5py.File(sample_raw_nc, "r") as src:
         lats = src["navigation_data/latitude"][ROW_START:ROW_END, COL_START:COL_END]
         lons = src["navigation_data/longitude"][ROW_START:ROW_END, COL_START:COL_END]
@@ -107,14 +106,11 @@ def init_multitime_nc(nc_path, sample_raw_nc, product):
                 for k in sorted(src["geophysical_data"].keys()):
                     if k.startswith("Rrs_"):
                         var_names.append(k)
-            # 质检标志位
             if "geophysical_data/flag" in src or ("geophysical_data" in src and "flag" in src["geophysical_data"]):
                 var_names.append("flag")
 
-    print(f"  [变量骨架构建] 检测到产品变量数: {len(var_names)} 个 -> {var_names}", flush=True)
-
     with netCDF4.Dataset(nc_path, "w", format="NETCDF4") as dst:
-        dst.createDimension("time", None)  # 无限时间维
+        dst.createDimension("time", None)
         dst.createDimension("rows", ROW_END - ROW_START)
         dst.createDimension("cols", COL_END - COL_START)
         dst.spatial_extent = "117.0E-126.0E, 25.0N-35.0N (Preserved 250m Native Resolution)"
@@ -131,7 +127,7 @@ def init_multitime_nc(nc_path, sample_raw_nc, product):
         v_time.units = "seconds since 1970-01-01 00:00:00"
         v_time.calendar = "standard"
 
-        # 12 波段与标志位 (开启多维分块压缩 chunksizes=(1, 512, 512))
+        # 12 波段与标志位
         for vname in var_names:
             dtype = "u4" if vname == "flag" else "f4"
             fill = None if vname == "flag" else np.nan
@@ -159,7 +155,6 @@ def append_slot_to_nc(nc_path, raw_nc, dt_slot, product):
                 for k in src["geophysical_data"].keys():
                     if k.startswith("Rrs_"):
                         var_data[k] = src[f"geophysical_data/{k}"][ROW_START:ROW_END, COL_START:COL_END]
-            # 提取 flag
             if "geophysical_data/flag" in src:
                 var_data["flag"] = src["geophysical_data/flag"][ROW_START:ROW_END, COL_START:COL_END]
 
@@ -176,80 +171,101 @@ def make_bar(pct, width=15):
     return "█" * filled + "░" * (width - filled)
 
 
+def process_single_day(year, month, day, product, hours, output_dir):
+    """处理单一完整自然日 (10 帧切片合并为单日独立单文件 ~500-600MB)"""
+    day_str = f"{year:04d}-{month:02d}-{day:02d}"
+    date_tag = f"{year:04d}{month:02d}{day:02d}"
+    out_nc_name = f"GOCI2_250m_ECS_{date_tag}_{product.upper()}.nc"
+    out_nc_path = os.path.join(output_dir, out_nc_name)
+
+    slots = get_available_slots(day_str)
+    target_slots = [s for s in slots if s.split("_")[-1][:2] in hours]
+
+    print(f"\n" + "=" * 88, flush=True)
+    print(f"  >>> 正在切片自然日: {day_str} ({date_tag})", flush=True)
+    print(f"  韩国服务器命中时次: {len(target_slots)}/{len(hours)} 个 | 产物目标: {out_nc_name}", flush=True)
+    print("=" * 88, flush=True)
+
+    if len(target_slots) == 0:
+        print(f"  [跳过] 该日无有效观测时次数据", flush=True)
+        return False
+
+    temp_nc = out_nc_path + ".tmp"
+    if os.path.exists(temp_nc):
+        try:
+            os.remove(temp_nc)
+        except Exception:
+            pass
+
+    nc_initialized = False
+    processed_count = 0
+    t0_day = time.time()
+
+    for s_idx, s_name in enumerate(target_slots, 1):
+        time_tag = s_name.split("_")[-1]  # HHMMSS
+        slot_dt = datetime.strptime(f"{day_str} {time_tag}", "%Y-%m-%d %H%M%S")
+        raw_fn = f"raw_tmp_{day_str}_{time_tag}.nc"
+        url = f"{BASE_OPENDAP}/{year:04d}/{month:02d}/{day:02d}/L2/{s_name}/GK2B_GOCI2_L2_{year:04d}{month:02d}{day:02d}_{time_tag}_LA_{product}.nc"
+
+        success, dt, speed = download_file_accelerated(url, raw_fn)
+        if success:
+            if not nc_initialized:
+                init_daily_nc(temp_nc, raw_fn, product)
+                nc_initialized = True
+
+            append_slot_to_nc(temp_nc, raw_fn, slot_dt, product)
+            try:
+                os.remove(raw_fn)
+            except Exception:
+                pass
+
+            processed_count += 1
+            pct = (processed_count / len(target_slots)) * 100
+            bar = make_bar(pct, width=12)
+            cur_sz_mb = os.path.getsize(temp_nc) / (1024 * 1024)
+            print(
+                f"  [{bar}] {pct:5.1f}% ({processed_count:02d}/{len(target_slots)}帧) "
+                f"| {time_tag[:2]}:{time_tag[2:4]} UTC "
+                f"| 拉取: {dt:4.1f}s ({speed:5.1f} MB/s) "
+                f"| 12波段切片入库 (单日大小: {cur_sz_mb:5.1f} MB)",
+                flush=True
+            )
+        else:
+            print(f"  [ ✗ 时次下载失败 ] {time_tag[:2]}:{time_tag[2:4]} UTC | 耗时 {dt:.1f}s", flush=True)
+
+    if nc_initialized and os.path.exists(temp_nc) and os.path.getsize(temp_nc) > 10 * 1024 * 1024:
+        if os.path.exists(out_nc_path):
+            os.remove(out_nc_path)
+        os.rename(temp_nc, out_nc_path)
+        final_mb = os.path.getsize(out_nc_path) / (1024 * 1024)
+        print(f"\n  ✓ [{day_str}] 单日切片完成！总计: {processed_count} 帧 | 体积: {final_mb:.1f} MB | 耗时: {(time.time()-t0_day)/60:.1f} 分钟", flush=True)
+        return True
+    return False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="GOCI-II 250m 清爽看板切片流水线 (12波段修复版)")
+    parser = argparse.ArgumentParser(description="GOCI-II 250m 按天独立单文件切片流水线 (12波段完整版)")
     parser.add_argument("--year_month", type=str, required=True, help="年月 YYYY-MM")
     parser.add_argument("--start_day", type=int, required=True, help="起始日 (1-31)")
     parser.add_argument("--end_day", type=int, required=True, help="结束日 (1-31)")
     parser.add_argument("--product", type=str, default="AC", choices=["AC", "TSS"])
     parser.add_argument("--hours", type=str, nargs="+", default=["23", "00", "01", "02", "03", "04", "05", "06", "07", "08"], help="UTC小时列表 (全覆盖10帧)")
-    parser.add_argument("--output", type=str, required=True, help="输出分块 nc 路径")
+    parser.add_argument("--output_dir", type=str, default="output_ecs", help="输出目录")
     args = parser.parse_args()
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     year, month = int(args.year_month.split("-")[0]), int(args.year_month.split("-")[1])
     num_days = args.end_day - args.start_day + 1
-    total_expected = num_days * len(args.hours)
 
     print("=" * 96, flush=True)
-    print(f"  GOCI-II 250m 原生切片与时序组装流水线 (12波段完整穿透提取版)", flush=True)
-    print(f"  目标区间: {args.year_month}-{args.start_day:02d} 至 {args.year_month}-{args.end_day:02d} (共 {num_days} 天) | 产品: {args.product}", flush=True)
-    print(f"  每日时次: 10 帧全覆盖 ({', '.join(args.hours)} UTC) | 理论总时次: {total_expected} 帧", flush=True)
-    print(f"  下载引擎: {'aria2c (16多线程极速版)' if shutil.which('aria2c') else 'curl (静默精简版)'}", flush=True)
-    print(f"  目标输出: {args.output}", flush=True)
+    print(f"  GOCI-II 250m 东海原生网格按天单文件流水线 (单日单文件 ~600MB·12波段完整修复版)", flush=True)
+    print(f"  区间: {args.year_month}-{args.start_day:02d} 至 {args.year_month}-{args.end_day:02d} (共 {num_days} 天) | 产品: {args.product}", flush=True)
+    print(f"  每日时次: 10 帧全覆盖 ({', '.join(args.hours)} UTC)", flush=True)
+    print(f"  单日产物格式: output_ecs/GOCI2_250m_ECS_YYYYMMDD_{args.product}.nc", flush=True)
     print("=" * 96, flush=True)
 
-    nc_initialized = False
-    total_processed = 0
-    t_start_all = time.time()
-
-    for d_idx, day in enumerate(range(args.start_day, args.end_day + 1), 1):
-        day_str = f"{year:04d}-{month:02d}-{day:02d}"
-        slots = get_available_slots(day_str)
-        target_slots = [s for s in slots if s.split("_")[-1][:2] in args.hours]
-
-        print(f"\n[第 {d_idx:02d}/{num_days:02d} 天] >>> {day_str} | 韩国服务器检索到 {len(target_slots)}/{len(args.hours)} 个有效时次", flush=True)
-
-        for s_idx, s_name in enumerate(target_slots, 1):
-            time_tag = s_name.split("_")[-1]  # HHMMSS
-            slot_dt = datetime.strptime(f"{day_str} {time_tag}", "%Y-%m-%d %H%M%S")
-            raw_fn = f"raw_tmp_{day_str}_{time_tag}.nc"
-            url = f"{BASE_OPENDAP}/{year:04d}/{month:02d}/{day:02d}/L2/{s_name}/GK2B_GOCI2_L2_{year:04d}{month:02d}{day:02d}_{time_tag}_LA_{args.product}.nc"
-
-            success, dt, speed = download_file_accelerated(url, raw_fn)
-            if success:
-                if not nc_initialized:
-                    init_multitime_nc(args.output, raw_fn, args.product)
-                    nc_initialized = True
-
-                append_slot_to_nc(args.output, raw_fn, slot_dt, args.product)
-                try:
-                    os.remove(raw_fn)
-                except Exception:
-                    pass
-
-                total_processed += 1
-                pct = (total_processed / total_expected) * 100
-                bar = make_bar(pct, width=15)
-                cur_sz_mb = os.path.getsize(args.output) / (1024 * 1024)
-                
-                # 规整单行输出看板
-                print(
-                    f"  [{bar}] {pct:5.1f}% ({total_processed:02d}/{total_expected}帧) "
-                    f"| {time_tag[:2]}:{time_tag[2:4]} UTC "
-                    f"| 拉取: {dt:4.1f}s ({speed:5.1f} MB/s) "
-                    f"| 12波段切片入库 (产物体积: {cur_sz_mb:5.1f} MB)",
-                    flush=True
-                )
-            else:
-                print(f"  [ ✗ 下载失败/不存在 ] {time_tag[:2]}:{time_tag[2:4]} UTC | 耗时 {dt:.1f}s", flush=True)
-
-    t_all_elapsed = time.time() - t_start_all
-    print("\n" + "=" * 96, flush=True)
-    print(f"  ✓ 分块切片任务执行完毕！累计处理: {total_processed} 帧 | 总耗时: {t_all_elapsed/60:.1f} 分钟", flush=True)
-    if os.path.exists(args.output):
-        print(f"  ✓ 产物立方体: {args.output} ({os.path.getsize(args.output)/(1024*1024):.2f} MB)", flush=True)
-    print("=" * 96, flush=True)
+    for day in range(args.start_day, args.end_day + 1):
+        process_single_day(year, month, day, args.product, args.hours, args.output_dir)
 
 
 if __name__ == "__main__":
